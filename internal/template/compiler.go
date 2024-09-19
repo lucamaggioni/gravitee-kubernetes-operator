@@ -18,9 +18,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	coreerrors "errors"
 	"fmt"
 	"strings"
 	"text/template"
+
+	"k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/gravitee-io/gravitee-kubernetes-operator/api/v1alpha1"
 	"github.com/gravitee-io/gravitee-kubernetes-operator/internal/core"
@@ -38,6 +41,10 @@ import (
 
 // example my-configmap/key1.
 const ksPropertyLength = 2
+
+type CustomError struct{}
+
+func (*CustomError) Error() string { return "heyo !" }
 
 func Compile(ctx context.Context, obj runtime.Object) error {
 	switch t := obj.(type) {
@@ -63,6 +70,7 @@ func exec(ctx context.Context, obj runtime.Object) error {
 			return resolveSecret(ctx, obj, name)
 		},
 	}
+
 	tmpl, err := template.New("gko").Funcs(template.FuncMap(funcMap)).Delims("[[", "]]").Parse(string(text))
 	if err != nil {
 		return err
@@ -71,7 +79,8 @@ func exec(ctx context.Context, obj runtime.Object) error {
 	buf := new(bytes.Buffer)
 	writer := bufio.NewWriter(buf)
 	if err = tmpl.Execute(writer, make(map[string]string)); err != nil {
-		return err
+		uErr := coreerrors.Unwrap(coreerrors.Unwrap(err))
+		return uErr
 	}
 
 	if err = writer.Flush(); err != nil {
@@ -100,7 +109,13 @@ func resolveConfigmap(ctx context.Context, obj runtime.Object, name string) (str
 	nn := types.NamespacedName{Namespace: u.GetNamespace(), Name: sp[0]}
 	cm := new(v1.ConfigMap)
 	cli := k8s.GetClient()
-	if err = cli.Get(ctx, nn, cm); err != nil {
+
+	err = cli.Get(ctx, nn, cm)
+	if errors.IsNotFound(err) {
+		return "", fmt.Errorf("configmap [%s/%s] not found", u.GetNamespace(), sp[0])
+	}
+
+	if err != nil {
 		return "", err
 	}
 
@@ -108,7 +123,11 @@ func resolveConfigmap(ctx context.Context, obj runtime.Object, name string) (str
 		return "", err
 	}
 
-	return cm.Data[sp[1]], nil
+	v := cm.Data[sp[1]]
+	if v == "" {
+		return "", fmt.Errorf("key [%s] not found in configmap [%s/%s]", sp[1], u.GetNamespace(), sp[0])
+	}
+	return v, nil
 }
 
 func resolveSecret(ctx context.Context, obj runtime.Object, name string) (string, error) {
@@ -130,7 +149,13 @@ func resolveSecret(ctx context.Context, obj runtime.Object, name string) (string
 	nn := types.NamespacedName{Namespace: u.GetNamespace(), Name: sp[0]}
 	sec := new(v1.Secret)
 	cli := k8s.GetClient()
-	if err = cli.Get(ctx, nn, sec); err != nil {
+
+	err = cli.Get(ctx, nn, sec)
+	if errors.IsNotFound(err) {
+		return "", fmt.Errorf("secret [%s/%s] not found", u.GetNamespace(), sp[0])
+	}
+
+	if err != nil {
 		return "", err
 	}
 
@@ -138,7 +163,11 @@ func resolveSecret(ctx context.Context, obj runtime.Object, name string) (string
 		return "", err
 	}
 
-	return string(sec.Data[sp[1]]), nil
+	v := sec.Data[sp[1]]
+	if len(v) == 0 {
+		return "", fmt.Errorf("key [%s] not found in secret [%s/%s]", sp[1], u.GetNamespace(), sp[0])
+	}
+	return string(v), nil
 }
 
 func addFinalizer(ctx context.Context, obj client.Object) error {
